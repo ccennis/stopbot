@@ -1,0 +1,20 @@
+# Personal runtime data — contains your real phone numbers, message
+# snippets, and keyword edits. Never commit this to a public repo.
+state.json
+keywords.json
+allowlist.txt
+
+# Logs — can contain message snippets/phone numbers too
+stopbot.log
+stopbot.out.log
+stopbot.err.log
+
+# Runtime lockfile
+stopbot.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.stopbot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_PYTHON_PATH</string>
+        <string>REPLACE_WITH_FULL_PATH/watcher.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_FULL_PATH/stopbot.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_FULL_PATH/stopbot.err.log</string>
+</dict>
+</plist>
