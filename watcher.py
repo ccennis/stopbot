@@ -55,6 +55,21 @@ USE_OLLAMA = True
 OLLAMA_MODEL = "llama3.2"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
+# Messages shorter than this never go to Ollama. Real bulk spam
+# (political fundraising, marketing) is long-form with links and
+# calls to action; a short message carries too little signal and the
+# model just guesses — which flagged a friend's literal "Test send".
+# Short messages can still match via keyword.
+OLLAMA_MIN_TEXT_LENGTH = 50
+
+# How many DISTINCT keywords must appear (as whole words) before the
+# keyword check fires. One political/marketing word in a real
+# conversation is normal ("are you going to vote?"); actual blasts pile
+# them up ("campaign" + "donate" + "election"...). Raise this if
+# dry-run logs still show keyword false positives, lower to 1 to make
+# any single keyword decisive again.
+KEYWORD_MIN_MATCHES = 2
+
 # If True, anyone in your Contacts app is NEVER evaluated, regardless of
 # what they text — even if their message happens to contain a keyword.
 # Strongly recommended: real spam/political texts come from numbers you
@@ -364,11 +379,39 @@ def get_all_incoming_messages():
 # ---------------------------------------------------------------------------
 
 def looks_like_spam_keyword(text):
+    """
+    Returns the list of keywords found in the message as WHOLE words
+    (so "vote" no longer matches "devoted", "fec" no longer matches
+    "perfect"). The caller fires only when at least KEYWORD_MIN_MATCHES
+    distinct keywords hit — one stray political word in a real
+    conversation is not a blast. Multi-word phrases ("paid for by",
+    "super pac") match as whole phrases the same way.
+    """
     text_lower = text.lower()
+    hits = []
     for term in get_all_keywords():
-        if term.lower() in text_lower:
-            return True
-    return False
+        term = term.lower().strip()
+        if not term:
+            continue
+        # (?<!\w)/(?!\w) instead of \b so phrases that start or end with
+        # punctuation ("msg & data rates may apply") still anchor cleanly.
+        if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text_lower):
+            hits.append(term)
+    return hits
+
+
+def has_bulk_marker(text):
+    """
+    True if the message contains a URL or a dollar amount. Bulk spam
+    with a call to action essentially always carries one of these
+    (donation link, promo link, dollar ask); genuine personal notes
+    essentially never do. Used to gate the Ollama check so a personal
+    message from an unsaved number can never be auto-flagged on the
+    model's judgment alone — that exact failure sent this bot after a
+    friend's "Test send". Keyword matches are not gated by this.
+    """
+    return bool(re.search(
+        r"https?://|www\.|\b\w[\w-]*\.[a-z]{2,}/\S|\$\d", text, re.I))
 
 
 def looks_like_spam_ollama(text):
@@ -376,18 +419,48 @@ def looks_like_spam_ollama(text):
     try:
         import urllib.request
 
+        # Few-shot with SPAM/OK labels and temperature 0. llama3.2-class
+        # models are unreliable with abstract zero-shot rules (tested:
+        # they answer the conservative default for everything at temp 0)
+        # but track concrete examples well. The examples deliberately
+        # cover the observed false-positive classes: transactional
+        # notifications, codes, and personal notes from unsaved numbers.
         prompt = (
-            "Reply with only one word, YES or NO. "
-            "Is the following text message unsolicited bulk spam — "
-            "political campaign/fundraising, marketing, promotions, "
-            "or similar automated outreach — as opposed to a personal "
-            "message from someone the recipient knows?\n\n"
-            f"Message: {text}\n\nAnswer:"
+            "You classify text messages as SPAM or OK. SPAM means bulk "
+            "outreach sent to many people: political fundraising or "
+            "get-out-the-vote asks, mass marketing, promotional blasts. "
+            "OK means everything else: deliveries, confirmations, "
+            "verification codes, account alerts, and personal notes. "
+            "Bulk texts often pretend to be from a specific person — "
+            "judge by the content, not the sender. If unsure, answer OK.\n\n"
+            "Message: It's Kamala. Tonight marks our campaign's final "
+            "fundraising deadline. Can you chip in $25 before midnight?\n"
+            "Answer: SPAM\n\n"
+            "Message: FINAL HOURS: 50% off sitewide ends tonight! Shop "
+            "now: example.com/deals\n"
+            "Answer: SPAM\n\n"
+            "Message: Your appointment is confirmed for Thursday at 2pm. "
+            "Reply C to confirm.\n"
+            "Answer: OK\n\n"
+            "Message: Your Uber code is 8841. Never share this code.\n"
+            "Answer: OK\n\n"
+            "Message: Delta: your flight DL1223 departs on time at "
+            "3:10pm from gate B7.\n"
+            "Answer: OK\n\n"
+            "Message: Hi, it's Sam from the book club — Rachel gave me "
+            "your number. We meet Thursday if you'd like to join!\n"
+            "Answer: OK\n\n"
+            "Reply with only one word, SPAM or OK.\n"
+            f"Message: {text}\n"
+            "Answer:"
         )
         payload = json.dumps({
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
+            # Deterministic: the same message must always classify the
+            # same way, and sampling noise was flipping borderline cases.
+            "options": {"temperature": 0},
         }).encode()
 
         req = urllib.request.Request(
@@ -397,7 +470,7 @@ def looks_like_spam_ollama(text):
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
         answer = data.get("response", "").strip().upper()
-        return answer.startswith("Y")
+        return answer.startswith("SPAM")
     except Exception as e:
         # Log only once per run instead of once per message, to avoid
         # flooding stopbot.log when Ollama isn't running/configured.
@@ -416,12 +489,16 @@ _ollama_warned = False
 def is_spam(text):
     """
     Returns (is_spam: bool, source: str) so every decision is traceable
-    in the log — "keyword" or "ollama". Ollama connection failures are
-    treated as NOT spam (fail-safe), never as a silent yes.
+    in the log — "keyword: <terms that hit>" or "ollama". Ollama
+    connection failures are treated as NOT spam (fail-safe), never as a
+    silent yes.
     """
-    if looks_like_spam_keyword(text):
-        return True, "keyword"
-    if USE_OLLAMA:
+    keyword_hits = looks_like_spam_keyword(text)
+    if len(keyword_hits) >= KEYWORD_MIN_MATCHES:
+        return True, "keyword: " + ", ".join(keyword_hits)
+    if (USE_OLLAMA
+            and len(text.strip()) >= OLLAMA_MIN_TEXT_LENGTH
+            and has_bulk_marker(text)):
         result = looks_like_spam_ollama(text)
         if result is True:
             return True, "ollama"
